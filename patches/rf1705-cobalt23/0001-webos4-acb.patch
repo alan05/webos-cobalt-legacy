@@ -1,0 +1,442 @@
+From 87f9e7e89c1457b6d545518b0ab4713ed8a931f6 Mon Sep 17 00:00:00 2001
+From: alan05 <alanoskylo@yahoo.com>
+Date: Sat, 31 Oct 2026 03:45:02 +0000
+Subject: [PATCH] webos4: add experimental legacy ACB playback support
+
+---
+ .../webos/arm/legacy_acb_video_plane.h        | 195 ++++++++++++++++++
+ .../webos/arm/shared_av_experiment.h          |   4 +-
+ .../webos/arm/starfish_av_components.cc       |  11 +-
+ .../webos/arm/starfish_video_decoder.cc       |  41 ++--
+ .../webos/arm/starfish_video_decoder.h        |   3 +-
+ 5 files changed, 231 insertions(+), 23 deletions(-)
+ create mode 100644 cobalt-platform/webos/arm/legacy_acb_video_plane.h
+
+diff --git a/cobalt-platform/webos/arm/legacy_acb_video_plane.h b/cobalt-platform/webos/arm/legacy_acb_video_plane.h
+new file mode 100644
+index 0000000..5a2a114
+--- /dev/null
++++ b/cobalt-platform/webos/arm/legacy_acb_video_plane.h
+@@ -0,0 +1,195 @@
++#ifndef STARBOARD_WEBOS_ARM_LEGACY_ACB_VIDEO_PLANE_H_
++#define STARBOARD_WEBOS_ARM_LEGACY_ACB_VIDEO_PLANE_H_
++
++#include <dlfcn.h>
++#include <cstdio>
++#include <mutex>
++
++namespace starboard {
++namespace shared {
++namespace webos {
++
++// webOS 2-4 video-plane adapter. This implementation targets legacy LG webOS 4.
++// Resolve the TV's existing libAcbAPI at runtime: no SDK ACB stubs or bundled
++// firmware libraries are required. No process-wide signal handlers installed.
++class LegacyAcbVideoPlane {
++ public:
++  LegacyAcbVideoPlane() = default;
++  ~LegacyAcbVideoPlane() { Close(); }
++  LegacyAcbVideoPlane(const LegacyAcbVideoPlane&) = delete;
++  LegacyAcbVideoPlane& operator=(const LegacyAcbVideoPlane&) = delete;
++
++  bool Open(const char* app_id) {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (id_ || !app_id || !*app_id) return false;
++    library_ = dlopen("libAcbAPI.so.1", RTLD_NOW | RTLD_LOCAL);
++    if (!library_) {
++      std::fprintf(stderr, "[webOS4 ACB] dlopen failed: %s\n", dlerror());
++      return false;
++    }
++    if (!Resolve(create_, "AcbAPI_create") ||
++        !Resolve(initialize_, "AcbAPI_initialize") ||
++        !Resolve(set_media_id_, "AcbAPI_setMediaId") ||
++        !Resolve(set_sink_type_, "AcbAPI_setSinkType") ||
++        !Resolve(set_state_, "AcbAPI_setState") ||
++        !Resolve(set_display_window_, "AcbAPI_setDisplayWindow") ||
++        !Resolve(set_media_video_data_, "AcbAPI_setMediaVideoData") ||
++        !Resolve(finalize_, "AcbAPI_finalize") ||
++        !Resolve(destroy_, "AcbAPI_destroy")) {
++      std::fprintf(stderr, "[webOS4 ACB] required API symbol missing\n");
++      CloseLocked();
++      return false;
++    }
++    id_ = create_();
++    if (!id_ || !initialize_(id_, 10 /* PLAYER_TYPE_MSE */, app_id,
++                              &LegacyAcbVideoPlane::Callback)) {
++      std::fprintf(stderr, "[webOS4 ACB] create/initialize failed\n");
++      CloseLocked();
++      return false;
++    }
++    initialized_ = true;
++    std::fprintf(stderr, "[webOS4 ACB] initialized app=%s\n", app_id);
++    return true;
++  }
++
++  bool BindMediaId(const char* media_id) {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (!initialized_ || !media_id || !*media_id) return false;
++    const bool ok = set_media_id_(id_, media_id);
++    std::fprintf(stderr, "[webOS4 ACB] bind media ID %s\n",
++                 ok ? "accepted" : "rejected");
++    return ok;
++  }
++
++  // Call *after* Starfish Load() returns true, not after LOADCOMPLETED.
++  void AfterLoad(int width, int height) {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (!initialized_ || width <= 0 || height <= 0) return;
++    set_display_window_(id_, 0, 0, width, height, true, &task_id_);
++  }
++
++  // webOS 4: attach the sink only after LOADCOMPLETED.
++  void OnLoadCompleted() {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (!initialized_ || loaded_) return;
++    set_sink_type_(id_, 0 /* SINK_TYPE_MAIN */);
++    set_state_(id_, 1 /* FOREGROUND */, 1 /* LOADED */, &task_id_);
++    loaded_ = true;
++    if (play_pending_) {
++      play_pending_ = false;
++      set_state_(id_, 1, 2 /* PLAYING */, &task_id_);
++    }
++  }
++
++  // First accepted Feed can precede LOADCOMPLETED. Queue PLAYING until LOADED.
++  void OnFirstAcceptedBuffer() {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (!initialized_) return;
++    if (!loaded_) {
++      play_pending_ = true;
++    } else {
++      set_state_(id_, 1, 2 /* PLAYING */, &task_id_);
++    }
++  }
++
++  // Re-enter PLAYING after a successful Starfish Play(), including resume.
++  void OnPlaying() {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (!initialized_) return;
++    if (!loaded_) {
++      play_pending_ = true;
++    } else {
++      set_state_(id_, 1, 2 /* PLAYING */, &task_id_);
++    }
++  }
++
++  // The SDK header for setMediaVideoData has historically been wrong;
++  // the TV's C wrapper accepts a third task-ID pointer.
++  void OnVideoInfo(const char* json) {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (initialized_ && json && *json) {
++      set_media_video_data_(id_, json, &task_id_);
++    }
++  }
++
++  void OnPause() {
++    std::lock_guard<std::mutex> guard(mutex_);
++    play_pending_ = false;
++    if (initialized_ && loaded_) {
++      set_state_(id_, 1, 3 /* PAUSED */, &task_id_);
++    }
++  }
++
++  void OnUnload() {
++    std::lock_guard<std::mutex> guard(mutex_);
++    if (initialized_ && loaded_) {
++      set_state_(id_, 1, 0 /* UNLOADED */, &task_id_);
++    }
++    loaded_ = false;
++    play_pending_ = false;
++  }
++
++  void Close() {
++    std::lock_guard<std::mutex> guard(mutex_);
++    CloseLocked();
++  }
++
++ private:
++  using CallbackFn = void (*)(long, long, long, long, long, const char*);
++  using CreateFn = long (*)();
++  using InitializeFn = bool (*)(long, int, const char*, CallbackFn);
++  using SetMediaIdFn = bool (*)(long, const char*);
++  using SetSinkTypeFn = bool (*)(long, int);
++  using SetStateFn = int (*)(long, int, int, long*);
++  using SetDisplayWindowFn = int (*)(long, long, long, long, long, bool, long*);
++  using SetMediaVideoDataFn = int (*)(long, const char*, long*);
++  using FinalizeFn = int (*)(long);
++  using DestroyFn = void (*)(long);
++
++  template <typename Fn>
++  bool Resolve(Fn& output, const char* symbol) {
++    output = reinterpret_cast<Fn>(dlsym(library_, symbol));
++    return output != nullptr;
++  }
++  void CloseLocked() {
++    if (id_ && initialized_) {
++      if (loaded_) set_state_(id_, 1, 0, &task_id_);
++      finalize_(id_);
++    }
++    if (id_ && destroy_) destroy_(id_);
++    id_ = 0;
++    initialized_ = false;
++    loaded_ = false;
++    play_pending_ = false;
++    if (library_) dlclose(library_);
++    library_ = nullptr;
++  }
++  static void Callback(long id, long task, long event, long app,
++                       long play, const char* reply) {
++    std::fprintf(stderr,
++                 "[webOS4 ACB] callback id=%ld task=%ld event=%ld app=%ld play=%ld %s\n",
++                 id, task, event, app, play, reply ? reply : "");
++  }
++
++  std::mutex mutex_;
++  void* library_ = nullptr;
++  long id_ = 0;
++  long task_id_ = 0;
++  bool initialized_ = false;
++  bool loaded_ = false;
++  bool play_pending_ = false;
++  CreateFn create_ = nullptr;
++  InitializeFn initialize_ = nullptr;
++  SetMediaIdFn set_media_id_ = nullptr;
++  SetSinkTypeFn set_sink_type_ = nullptr;
++  SetStateFn set_state_ = nullptr;
++  SetDisplayWindowFn set_display_window_ = nullptr;
++  SetMediaVideoDataFn set_media_video_data_ = nullptr;
++  FinalizeFn finalize_ = nullptr;
++  DestroyFn destroy_ = nullptr;
++};
++
++}  // namespace webos
++}  // namespace shared
++}  // namespace starboard
++#endif  // STARBOARD_WEBOS_ARM_LEGACY_ACB_VIDEO_PLANE_H_
+diff --git a/cobalt-platform/webos/arm/shared_av_experiment.h b/cobalt-platform/webos/arm/shared_av_experiment.h
+index e6126b9..9ea8ccd 100644
+--- a/cobalt-platform/webos/arm/shared_av_experiment.h
++++ b/cobalt-platform/webos/arm/shared_av_experiment.h
+@@ -17,7 +17,7 @@ namespace webos {
+ // temporary TV marker used by earlier diagnostic packages.
+ // 1 = H.264 SDR, 2 = VP9/AV1 UHD SDR, 3 = VP9/AV1 UHD HDR (default).
+ inline int ParseSharedAvBackendMode(const char* value) {
+-  if (!value) return 3;
++  if (!value) return 0;  // webOS 4 default: legacy ACB decoder.
+   if (std::strcmp(value, "0") == 0) return 0;
+   if (std::strcmp(value, "1") == 0) return 1;
+   if (std::strcmp(value, "2") == 0) return 2;
+@@ -32,7 +32,7 @@ inline int ReadConfiguredSharedAvBackendMode() {
+ 
+   FILE* marker = std::fopen("/tmp/ytaf-shared-av.enable", "r");
+   if (!marker) {
+-    return 3;
++    return 0;  // Disable shared backend by default for webOS 4.
+   }
+   const int marker_value = std::fgetc(marker);
+   std::fclose(marker);
+diff --git a/cobalt-platform/webos/arm/starfish_av_components.cc b/cobalt-platform/webos/arm/starfish_av_components.cc
+index b8cd804..fc0de30 100644
+--- a/cobalt-platform/webos/arm/starfish_av_components.cc
++++ b/cobalt-platform/webos/arm/starfish_av_components.cc
+@@ -555,10 +555,15 @@ class Owner : public player::JobQueue::JobOwner {
+     const char* codec_name = CodecName(video_codec_);
+     const int max_width = video_codec_ == kSbMediaVideoCodecH264 ? 1920 : 3840;
+     const int max_height = video_codec_ == kSbMediaVideoCodecH264 ? 1080 : 2160;
+-    // Window ID is generated by SDL; app ID stays fixed, not unescaped input.
++    const char* app_id = std::getenv("APPID");
++    if (!app_id || !*app_id) {
++      FailSession(*session, "webOS application ID unavailable");
++      return nullptr;
++    }
++    // Always register the running application, not the original YouTube.
+     const std::string payload = FormatString(
+         "{\"args\":[{\"mediaTransportType\":\"BUFFERSTREAM\",\"option\":{"
+-        "\"appId\":\"youtube.leanback.v4\",\"windowId\":\"%s\",\"queryPosition\":false,"
++        "\"appId\":\"%s\",\"windowId\":\"%s\",\"queryPosition\":false,"
+         "\"externalStreamingInfo\":{\"contents\":{\"format\":\"RAW\",\"provider\":\"Chrome\","
+         "\"codec\":{\"video\":\"%s\",\"audio\":\"OPUS\"},"
+         "\"esInfo\":{\"pauseAtDecodeTime\":false,\"seperatedPTS\":true,\"ptsToDecode\":%lld,"
+@@ -569,7 +574,7 @@ class Owner : public player::JobQueue::JobOwner {
+         "\"srcBufferLevelVideo\":{\"minimum\":1024,\"maximum\":8388608}}},"
+         "\"adaptiveStreaming\":{\"audioOnly\":false,\"adaptiveResolution\":true,"
+         "\"maxWidth\":%d,\"maxHeight\":%d,\"maxFrameRate\":60}}}]}",
+-        window.c_str(), codec_name,
++        app_id, window.c_str(), codec_name,
+         static_cast<long long>(plan.target_native_us * 1000), width, height,
+         unsigned(config_.header[9]), Base64(plan.config.header).c_str(),
+         max_width, max_height);
+diff --git a/cobalt-platform/webos/arm/starfish_video_decoder.cc b/cobalt-platform/webos/arm/starfish_video_decoder.cc
+index 2a52317..d102022 100644
+--- a/cobalt-platform/webos/arm/starfish_video_decoder.cc
++++ b/cobalt-platform/webos/arm/starfish_video_decoder.cc
+@@ -210,10 +210,8 @@ StarfishVideoDecoder::~StarfishVideoDecoder() {
+     decoder_thread_.reset();
+   }
+   CancelPendingJobs();
+-  if (exported_window_acquired_) {
+-    ApplicationSdl::Get()->ReleaseExportedVideoWindow();
+-    exported_window_acquired_ = false;
+-  }
++  // Releases the ACB registration after the decoder pipeline is destroyed.
++  acb_.Close();
+ }
+ 
+ void StarfishVideoDecoder::Initialize(const DecoderStatusCB& decoder_status_cb,
+@@ -223,10 +221,9 @@ void StarfishVideoDecoder::Initialize(const DecoderStatusCB& decoder_status_cb,
+   SB_DCHECK(error_cb);
+   decoder_status_cb_ = decoder_status_cb;
+   error_cb_ = error_cb;
+-  exported_window_acquired_ =
+-      ApplicationSdl::Get()->AcquireExportedVideoWindow();
+-  if (!exported_window_acquired_) {
+-    ReportError("SDL did not create a webOS exported video window.");
++  const char* app_id = std::getenv("APPID");
++  if (!app_id || !*app_id || !acb_.Open(app_id)) {
++    ReportError("webOS 4 ACB video plane could not initialize.");
+     return;
+   }
+   decoder_thread_.reset(new starboard::player::JobThread(
+@@ -235,7 +232,7 @@ void StarfishVideoDecoder::Initialize(const DecoderStatusCB& decoder_status_cb,
+ 
+ void StarfishVideoDecoder::SetPause(bool pause) {
+   pause_requested_.store(pause);
+-  ApplicationSdl::Get()->SetVideoPaused(pause);
++  if (pause) acb_.OnPause();
+   if (decoder_thread_) {
+     decoder_thread_->Schedule(std::bind(
+         &StarfishVideoDecoder::ApplyPlaybackStateOnDecoderThread, this));
+@@ -248,7 +245,7 @@ void StarfishVideoDecoder::SetPlaybackRate(double playback_rate) {
+   }
+   playback_rate_millionths_.store(
+       static_cast<int>(playback_rate * 1000000.0));
+-  ApplicationSdl::Get()->SetVideoPaused(playback_rate <= 0.0);
++  if (playback_rate <= 0.0) acb_.OnPause();
+   if (decoder_thread_) {
+     decoder_thread_->Schedule(std::bind(
+         &StarfishVideoDecoder::ApplyPlaybackStateOnDecoderThread, this));
+@@ -276,11 +273,12 @@ void StarfishVideoDecoder::InitializePipeline(
+   const char* codec_name = CodecName(codec_);
+   const char* app_id = std::getenv("APPID");
+   if (!app_id || !*app_id) {
+-    app_id = "youtube.leanback.v4";
++    ReportError("webOS application ID is missing.");
++    return;
+   }
+-  const std::string& window_id = ApplicationSdl::Get()->GetExportedWindowId();
+-  if (window_id.empty()) {
+-    ReportError("SDL did not create a webOS exported video window.");
++  // webOS 4 uses the media ID out-of-band; there is no SDL windowId.
++  if (!acb_.BindMediaId(media_api_->getMediaID())) {
++    ReportError("ACB rejected Starfish media ID.");
+     return;
+   }
+ 
+@@ -289,7 +287,7 @@ void StarfishVideoDecoder::InitializePipeline(
+       GetAdaptiveVideoCapabilities(codec_, sample_info);
+   std::string payload = FormatString(
+       "{\"args\":[{\"mediaTransportType\":\"BUFFERSTREAM\","
+-      "\"option\":{\"windowId\":\"%s\",\"appId\":\"%s\","
++      "\"option\":{\"appId\":\"%s\","
+       "\"queryPosition\":false,"
+       "\"externalStreamingInfo\":{\"contents\":{\"codec\":{"
+       "\"video\":\"%s\"},\"esInfo\":{\"pauseAtDecodeTime\":true,"
+@@ -309,14 +307,15 @@ void StarfishVideoDecoder::InitializePipeline(
+       "\"adaptiveResolution\":true,\"maxWidth\":%d,"
+       "\"maxHeight\":%d,\"maxFrameRate\":%d},"
+       "\"forcedPrerollOnPause\":true,\"seekMode\":\"keep-rate\"}}]}",
+-      window_id.c_str(), app_id, codec_name, target_pts_ns, width, height,
++      app_id, codec_name, target_pts_ns, width, height,
+       capabilities.width, capabilities.height, capabilities.frame_rate);
+ 
+   SB_LOG(INFO) << "Loading Starfish hardware decoder for " << codec_name
+                << " at " << width << "x" << height
+                << " with adaptive maximum " << capabilities.width << "x"
+                << capabilities.height << "@" << capabilities.frame_rate
+-               << " using window " << window_id;
++                               << " using ACB video plane";
++
+   media_api_->notifyForeground();
+   if (!media_api_->Load(payload.c_str(), &StarfishVideoDecoder::PlayerCallback,
+                         this)) {
+@@ -324,6 +323,7 @@ void StarfishVideoDecoder::InitializePipeline(
+     return;
+   }
+   pipeline_loaded_ = true;
++  acb_.AfterLoad(width, height);
+   ApplyHdrInfo(sample_info.color_metadata);
+   play_issued_ = false;
+   pause_issued_ = false;
+@@ -382,6 +382,7 @@ void StarfishVideoDecoder::FeedBuffer(
+     // others refuse an early Play(). Retry until one startup Play is accepted,
+     // but do not restart playback for every buffer after an intentional Pause.
+     if (!startup_play_accepted_) {
++      acb_.OnFirstAcceptedBuffer();
+       EnsurePlayingOnDecoderThread("first accepted buffer", false);
+       startup_play_accepted_ = play_issued_;
+     }
+@@ -424,6 +425,7 @@ void StarfishVideoDecoder::EnsurePlayingOnDecoderThread(const char* reason,
+   SB_LOG(INFO) << "Starfish Play() after " << reason << " -> "
+                << (accepted ? "accepted" : "refused; will retry");
+   if (accepted) {
++    acb_.OnPlaying();
+     play_issued_ = true;
+     pause_issued_ = false;
+   }
+@@ -484,6 +486,7 @@ void StarfishVideoDecoder::OnLoadCompletedOnDecoderThread() {
+   // An early Play() can be accepted but remain queued.  Reissuing it at the
+   // point at which the pipeline declares itself ready is harmless and fixes
+   // that firmware behaviour.
++  acb_.OnLoadCompleted();
+   EnsurePlayingOnDecoderThread("LOADCOMPLETED", true);
+   ApplyPlaybackStateOnDecoderThread();
+ }
+@@ -555,6 +558,7 @@ void StarfishVideoDecoder::ResetOnDecoderThread() {
+       }
+       pipeline_state_mutex_.Release();
+     }
++    acb_.OnUnload();
+     media_api_.reset(new StarfishMediaAPIs());
+     pipeline_loaded_ = false;
+     video_width_ = 0;
+@@ -600,6 +604,9 @@ void StarfishVideoDecoder::HandlePlayerEvent(int type,
+   if (reset_in_progress_.load()) {
+     return;
+   }
++  if (type == PF_EVENT_TYPE_STR_VIDEO_INFO) {
++    acb_.OnVideoInfo(str_value);
++  }
+   if (type == PF_EVENT_TYPE_FRAMEREADY) {
+     const SbTime frame_time = static_cast<SbTime>(num_value / 1000);
+     const SbTime target_time = seek_to_time_.load();
+diff --git a/cobalt-platform/webos/arm/starfish_video_decoder.h b/cobalt-platform/webos/arm/starfish_video_decoder.h
+index c1d2d20..72fd8d4 100644
+--- a/cobalt-platform/webos/arm/starfish_video_decoder.h
++++ b/cobalt-platform/webos/arm/starfish_video_decoder.h
+@@ -5,6 +5,7 @@
+ #include <string>
+ 
+ #include <starfish-media-pipeline/StarfishMediaAPIs.h>
++#include "starboard/webos/arm/legacy_acb_video_plane.h"
+ 
+ #include "starboard/common/condition_variable.h"
+ #include "starboard/common/mutex.h"
+@@ -63,6 +64,7 @@ class StarfishVideoDecoder
+ 
+   SbMediaVideoCodec codec_;
+   scoped_ptr<StarfishMediaAPIs> media_api_;
++  LegacyAcbVideoPlane acb_;
+   scoped_ptr<starboard::player::JobThread> decoder_thread_;
+   DecoderStatusCB decoder_status_cb_;
+   ErrorCB error_cb_;
+@@ -70,7 +72,6 @@ class StarfishVideoDecoder
+   Mutex pipeline_state_mutex_;
+   ConditionVariable pipeline_state_condition_;
+   bool pipeline_loaded_ = false;
+-  bool exported_window_acquired_ = false;
+   bool stream_ended_ = false;
+   bool eos_output_ = false;
+   int video_width_ = 0;
+-- 
+2.56.0
+
