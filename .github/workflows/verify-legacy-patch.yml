@@ -1,0 +1,45 @@
+name: Verify legacy webOS 4 ACB patch
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify Cobalt 23 webOS 4 patch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out engineering repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify script syntax
+        shell: bash
+        run: bash -n scripts/verify-legacy-patch.sh
+
+      - name: Fetch pinned public Cobalt source history
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --quiet --no-checkout \
+            --filter=blob:none \
+            --single-branch \
+            --branch main \
+            https://github.com/alan05/youtube-webos4-cobalt-adfree.git \
+            "$RUNNER_TEMP/cobalt-source"
+
+      - name: Replay and verify legacy ACB patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/verify-legacy-patch.sh \
+            "$RUNNER_TEMP/cobalt-source"
